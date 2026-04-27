@@ -365,7 +365,6 @@ pub enum LoggerType {
     Error,
 }
 
-#[derive(Clone)]
 struct NativeCapture {
     original_stdout: libc::c_int,
     original_stderr: libc::c_int,
@@ -373,13 +372,24 @@ struct NativeCapture {
     stderr_read: libc::c_int,
 }
 
+// Native log capture replaces process-global stdout/stderr file descriptors.
+// Tracking the active capture in a single global slot is required for safety
+// under concurrent execution: if two requests both took their own per-Logger
+// redirect, the second's dup2 would clobber the first, and the first's revert
+// would leave the second writing to a torn-down pipe. With a global slot,
+// the first request to override owns the redirect; concurrent requests
+// gracefully skip native capture (their structured context.log calls still
+// work). Required by runtimes whose timeout path can leave a user function
+// running on a detached blocking thread.
+static NATIVE_CAPTURE: Mutex<Option<NativeCapture>> = Mutex::new(None);
+
 #[derive(Clone)]
 pub struct Logger {
     pub id: String,
     enabled: bool,
     include_native: bool,
     logs: Arc<Mutex<Vec<serde_json::Value>>>,
-    native_capture: Arc<Mutex<Option<NativeCapture>>>,
+    owns_native_capture: Arc<Mutex<bool>>,
     native_info_logged: Arc<Mutex<bool>>,
 }
 
@@ -401,7 +411,7 @@ impl Logger {
             enabled,
             include_native,
             logs: Arc::new(Mutex::new(Vec::new())),
-            native_capture: Arc::new(Mutex::new(None)),
+            owns_native_capture: Arc::new(Mutex::new(false)),
             native_info_logged: Arc::new(Mutex::new(false)),
         })
     }
@@ -491,10 +501,23 @@ impl Logger {
             return;
         }
 
-        if let Ok(lock) = self.native_capture.lock() {
-            if lock.is_some() {
-                return;
-            }
+        let mut owns = match self.owns_native_capture.lock() {
+            Ok(o) => o,
+            Err(p) => p.into_inner(),
+        };
+        if *owns {
+            return;
+        }
+
+        let mut global = match NATIVE_CAPTURE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if global.is_some() {
+            // Another logger already redirected the process-global stdout/stderr.
+            // Skip native capture for this request — concurrent redirects would
+            // race on the dup2 + revert sequence.
+            return;
         }
 
         unsafe {
@@ -553,34 +576,34 @@ impl Logger {
             libc::close(stdout_pipe[1]);
             libc::close(stderr_pipe[1]);
 
-            let capture = NativeCapture {
+            *global = Some(NativeCapture {
                 original_stdout,
                 original_stderr,
                 stdout_read: stdout_pipe[0],
                 stderr_read: stderr_pipe[0],
-            };
-
-            if let Ok(mut lock) = self.native_capture.lock() {
-                *lock = Some(capture);
-            } else {
-                libc::dup2(original_stdout, libc::STDOUT_FILENO);
-                libc::dup2(original_stderr, libc::STDERR_FILENO);
-                libc::close(original_stdout);
-                libc::close(original_stderr);
-                libc::close(stdout_pipe[0]);
-                libc::close(stderr_pipe[0]);
-            }
+            });
+            *owns = true;
         }
     }
 
     pub fn revert_native_logs(&mut self) {
-        let capture = {
-            let mut lock = match self.native_capture.lock() {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-            lock.take()
+        let mut owns = match self.owns_native_capture.lock() {
+            Ok(o) => o,
+            Err(p) => p.into_inner(),
         };
+        if !*owns {
+            return;
+        }
+
+        let capture = {
+            let mut global = match NATIVE_CAPTURE.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            global.take()
+        };
+
+        *owns = false;
 
         let Some(capture) = capture else { return };
 
