@@ -8,6 +8,7 @@ jobs:
   publish:
     name: Build and publish to crates.io
     runs-on: ubuntu-latest
+    environment: crates-io
     steps:
       - name: Check out code
         uses: actions/checkout@v4
