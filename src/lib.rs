@@ -366,17 +366,27 @@ pub enum LoggerType {
 }
 
 #[derive(Clone)]
+struct NativeCapture {
+    original_stdout: libc::c_int,
+    original_stderr: libc::c_int,
+    stdout_read: libc::c_int,
+    stderr_read: libc::c_int,
+}
+
+#[derive(Clone)]
 pub struct Logger {
     pub id: String,
     enabled: bool,
     include_native: bool,
     logs: Arc<Mutex<Vec<serde_json::Value>>>,
+    native_capture: Arc<Mutex<Option<NativeCapture>>>,
+    native_info_logged: Arc<Mutex<bool>>,
 }
 
 impl Logger {
     pub fn new(logging: &str, log_id: Option<String>) -> Result<Self, String> {
         let enabled = logging == "" || logging == "enabled";
-        let include_native = logging == "enabled" || logging == "disabled";
+        let include_native = enabled;
 
         let id = if let Some(provided_id) = log_id {
             provided_id
@@ -391,6 +401,8 @@ impl Logger {
             enabled,
             include_native,
             logs: Arc::new(Mutex::new(Vec::new())),
+            native_capture: Arc::new(Mutex::new(None)),
+            native_info_logged: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -418,6 +430,22 @@ impl Logger {
 
         if native && !self.include_native {
             return;
+        }
+
+        if native {
+            let mut info_logged = match self.native_info_logged.lock() {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            if !*info_logged {
+                *info_logged = true;
+                drop(info_logged);
+                self.write(
+                    vec!["Native logs detected. Use context.log() or context.error() for better experience.".to_string()],
+                    LoggerType::Log,
+                    false,
+                );
+            }
         }
 
         let type_str = match log_type {
@@ -456,23 +484,168 @@ impl Logger {
         if let Ok(mut logs) = self.logs.lock() {
             logs.push(log_entry);
         }
+    }
 
-        if native {
-            let message = messages.join(" ");
-            match log_type {
-                LoggerType::Log => println!("{}", message),
-                LoggerType::Error => eprintln!("{}", message),
+    pub fn override_native_logs(&mut self) {
+        if !self.enabled || !self.include_native {
+            return;
+        }
+
+        if let Ok(lock) = self.native_capture.lock() {
+            if lock.is_some() {
+                return;
+            }
+        }
+
+        unsafe {
+            let mut stdout_pipe: [libc::c_int; 2] = [-1, -1];
+            let mut stderr_pipe: [libc::c_int; 2] = [-1, -1];
+
+            if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
+                return;
+            }
+            if libc::pipe(stderr_pipe.as_mut_ptr()) != 0 {
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                return;
+            }
+
+            let original_stdout = libc::dup(libc::STDOUT_FILENO);
+            let original_stderr = libc::dup(libc::STDERR_FILENO);
+
+            if original_stdout < 0 || original_stderr < 0 {
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[0]);
+                libc::close(stderr_pipe[1]);
+                if original_stdout >= 0 {
+                    libc::close(original_stdout);
+                }
+                if original_stderr >= 0 {
+                    libc::close(original_stderr);
+                }
+                return;
+            }
+
+            if libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO) < 0 {
+                libc::dup2(original_stdout, libc::STDOUT_FILENO);
+                libc::close(original_stdout);
+                libc::close(original_stderr);
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[0]);
+                libc::close(stderr_pipe[1]);
+                return;
+            }
+
+            if libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) < 0 {
+                libc::dup2(original_stdout, libc::STDOUT_FILENO);
+                libc::dup2(original_stderr, libc::STDERR_FILENO);
+                libc::close(original_stdout);
+                libc::close(original_stderr);
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[0]);
+                libc::close(stderr_pipe[1]);
+                return;
+            }
+
+            libc::close(stdout_pipe[1]);
+            libc::close(stderr_pipe[1]);
+
+            let capture = NativeCapture {
+                original_stdout,
+                original_stderr,
+                stdout_read: stdout_pipe[0],
+                stderr_read: stderr_pipe[0],
+            };
+
+            if let Ok(mut lock) = self.native_capture.lock() {
+                *lock = Some(capture);
+            } else {
+                libc::dup2(original_stdout, libc::STDOUT_FILENO);
+                libc::dup2(original_stderr, libc::STDERR_FILENO);
+                libc::close(original_stdout);
+                libc::close(original_stderr);
+                libc::close(stdout_pipe[0]);
+                libc::close(stderr_pipe[0]);
             }
         }
     }
 
-    pub fn override_native_logs(&mut self) {
-        // In Rust, capturing stdout/stderr is complex and not typically done
-        // We'll handle native logs through our write method instead
-    }
-
     pub fn revert_native_logs(&mut self) {
-        // Matching the override method
+        let capture = {
+            let mut lock = match self.native_capture.lock() {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            lock.take()
+        };
+
+        let Some(capture) = capture else { return };
+
+        unsafe {
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+
+            libc::dup2(capture.original_stdout, libc::STDOUT_FILENO);
+            libc::dup2(capture.original_stderr, libc::STDERR_FILENO);
+
+            libc::close(capture.original_stdout);
+            libc::close(capture.original_stderr);
+        }
+
+        let stdout_data = unsafe {
+            let mut data = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(
+                    capture.stdout_read,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                );
+                if n <= 0 {
+                    break;
+                }
+                data.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+            }
+            libc::close(capture.stdout_read);
+            data
+        };
+
+        let stderr_data = unsafe {
+            let mut data = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(
+                    capture.stderr_read,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                );
+                if n <= 0 {
+                    break;
+                }
+                data.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+            }
+            libc::close(capture.stderr_read);
+            data
+        };
+
+        if !stdout_data.is_empty() {
+            for line in stdout_data.lines() {
+                if !line.is_empty() {
+                    self.write(vec![line.to_string()], LoggerType::Log, true);
+                }
+            }
+        }
+
+        if !stderr_data.is_empty() {
+            for line in stderr_data.lines() {
+                if !line.is_empty() {
+                    self.write(vec![line.to_string()], LoggerType::Error, true);
+                }
+            }
+        }
     }
 
     pub fn end(&self) {
@@ -545,4 +718,67 @@ impl Logger {
 
 pub fn format_log_message(value: &dyn std::fmt::Debug) -> String {
     format!("{:?}", value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_native_log_capture() {
+        let mut logger = Logger::new("enabled", Some("test".to_string())).unwrap();
+        logger.override_native_logs();
+        unsafe {
+            let msg = b"Native log\n";
+            libc::write(libc::STDOUT_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+            let err = b"Native error\n";
+            libc::write(libc::STDERR_FILENO, err.as_ptr() as *const libc::c_void, err.len());
+        }
+        logger.revert_native_logs();
+
+        let logs = logger.logs.lock().unwrap();
+        let log_messages: Vec<String> = logs
+            .iter()
+            .map(|l| l.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+
+        assert!(log_messages.iter().any(|m| m.contains("Native logs detected. Use context.log() or context.error() for better experience.")));
+        assert!(log_messages.iter().any(|m| m == "Native log"));
+        assert!(log_messages.iter().any(|m| m == "Native error"));
+    }
+
+    #[test]
+    fn test_native_info_logged_once() {
+        let mut logger = Logger::new("enabled", Some("test2".to_string())).unwrap();
+        logger.override_native_logs();
+        unsafe {
+            let msg1 = b"First native log\n";
+            libc::write(libc::STDOUT_FILENO, msg1.as_ptr() as *const libc::c_void, msg1.len());
+            let msg2 = b"Second native log\n";
+            libc::write(libc::STDOUT_FILENO, msg2.as_ptr() as *const libc::c_void, msg2.len());
+        }
+        logger.revert_native_logs();
+
+        let logs = logger.logs.lock().unwrap();
+        let info_count = logs
+            .iter()
+            .filter(|l| {
+                let msg = l.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                msg.contains("Native logs detected")
+            })
+            .count();
+
+        assert_eq!(info_count, 1);
+    }
+
+    #[test]
+    fn test_disabled_logging_no_native_capture() {
+        let mut logger = Logger::new("disabled", Some("test3".to_string())).unwrap();
+        logger.override_native_logs();
+        println!("Should not be captured");
+        logger.revert_native_logs();
+
+        let logs = logger.logs.lock().unwrap();
+        assert!(logs.is_empty());
+    }
 }
