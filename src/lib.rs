@@ -138,6 +138,10 @@ pub struct ContextRequest {
     pub path: String,
     pub query_string: String,
     pub query: HashMap<String, String>,
+    /// The underlying `http::Request` the runtime received, with the body
+    /// already read into memory. It is passed through as-is, so unlike
+    /// `headers` it still carries the `x-open-runtimes-*` control headers.
+    pub raw: Option<http::Request<Vec<u8>>>,
     body_binary: Vec<u8>,
     body_parsed: Option<serde_json::Value>,
 }
@@ -154,6 +158,7 @@ impl ContextRequest {
             path: String::new(),
             query_string: String::new(),
             query: HashMap::new(),
+            raw: None,
             body_binary: Vec::new(),
             body_parsed: None,
         }
