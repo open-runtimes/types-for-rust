@@ -11,9 +11,9 @@ jobs:
     environment: crates-io
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - name: Update version
         env:
           VERSION: ${{ github.event.release.tag_name }}
